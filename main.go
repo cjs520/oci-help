@@ -1,25 +1,3 @@
-/*
-  甲骨文云API文档
-  https://docs.oracle.com/en-us/iaas/api/#/en/iaas/20160918/
-
-  实例:
-  https://docs.oracle.com/en-us/iaas/api/#/en/iaas/20160918/Instance/
-  VCN:
-  https://docs.oracle.com/en-us/iaas/api/#/en/iaas/20160918/Vcn/
-  Subnet:
-  https://docs.oracle.com/en-us/iaas/api/#/en/iaas/20160918/Subnet/
-  VNIC:
-  https://docs.oracle.com/en-us/iaas/api/#/en/iaas/20160918/Vnic/
-  VnicAttachment:
-  https://docs.oracle.com/en-us/iaas/api/#/en/iaas/20160918/VnicAttachment/
-  私有IP
-  https://docs.oracle.com/en-us/iaas/api/#/en/iaas/20160918/PrivateIp/
-  公共IP
-  https://docs.oracle.com/en-us/iaas/api/#/en/iaas/20160918/PublicIp/
-
-  获取可用性域
-  https://docs.oracle.com/en-us/iaas/api/#/en/identity/20160918/AvailabilityDomain/ListAvailabilityDomains
-*/
 package main
 
 import (
@@ -29,25 +7,25 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"io"
+	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	"io/ioutil"
+	"log"
 	"math"
 	"math/rand"
 	"net/http"
 	"net/url"
-	"os"
-	"os/exec"
 	"strconv"
 	"strings"
 	"sync"
-	"text/tabwriter"
 	"time"
 
-	"github.com/oracle/oci-go-sdk/v54/common"
-	"github.com/oracle/oci-go-sdk/v54/core"
-	"github.com/oracle/oci-go-sdk/v54/example/helpers"
-	"github.com/oracle/oci-go-sdk/v54/identity"
-	"gopkg.in/ini.v1"
+	"github.com/go-ini/ini"
+	"github.com/oracle/oci-go-sdk/v65/usageapi"
+
+	"github.com/oracle/oci-go-sdk/v65/common"
+	"github.com/oracle/oci-go-sdk/v65/core"
+	"github.com/oracle/oci-go-sdk/v65/example/helpers"
+	"github.com/oracle/oci-go-sdk/v65/identity"
 )
 
 const (
@@ -56,6 +34,10 @@ const (
 )
 
 var (
+	instanceMutex       sync.Mutex
+	lastCallbackID      string
+	callbackMutex       sync.Mutex
+	bot                 *tgbotapi.BotAPI
 	configFilePath      string
 	provider            common.ConfigurationProvider
 	computeClient       core.ComputeClient
@@ -126,6 +108,7 @@ func main() {
 
 	cfg, err := ini.Load(configFilePath)
 	helpers.FatalIfError(err)
+
 	defSec := cfg.Section(ini.DefaultSection)
 	proxy = defSec.Key("proxy").Value()
 	token = defSec.Key("token").Value()
@@ -155,73 +138,1087 @@ func main() {
 		}
 	}
 	if len(oracleSections) == 0 {
-		fmt.Printf("\033[1;31m未找到正确的配置信息, 请参考链接文档配置相关信息。链接: https://github.com/lemoex/oci-help\033[0m\n")
-		return
+		log.Fatalf("未找到正确的配置信息, 请参考链接文档配置相关信息。链接: https://github.com/lemoex/oci-help")
 	}
 	instanceBaseSection = cfg.Section("INSTANCE")
 
-	listOracleAccount()
+	bot, err = tgbotapi.NewBotAPI(token)
+	if err != nil {
+		log.Panic(err)
+	}
+
+	log.Printf("Authorized on account %s", bot.Self.UserName)
+
+	u := tgbotapi.NewUpdate(0)
+	u.Timeout = 60
+
+	updates := bot.GetUpdatesChan(u)
+
+	for update := range updates {
+		if update.CallbackQuery != nil {
+			handleCallback(update.CallbackQuery)
+		} else if update.Message != nil {
+			handleMessage(update.Message)
+		}
+	}
 }
 
-func listOracleAccount() {
-	if len(oracleSections) == 1 {
-		oracleSection = oracleSections[0]
-	} else {
-		fmt.Printf("\n\033[1;32m%s\033[0m\n\n", "欢迎使用甲骨文实例管理工具")
-		w := new(tabwriter.Writer)
-		w.Init(os.Stdout, 4, 8, 1, '\t', 0)
-		fmt.Fprintf(w, "%s\t%s\t\n", "序号", "账号")
-		for i, section := range oracleSections {
-			fmt.Fprintf(w, "%d\t%s\t\n", i+1, section.Name())
+func handleMessage(message *tgbotapi.Message) {
+	if message.IsCommand() {
+		switch message.Command() {
+		case "start":
+			sendMainMenu(message.Chat.ID)
+		default:
+			msg := tgbotapi.NewMessage(message.Chat.ID, "未知命令，请使用 /start 开始")
+			bot.Send(msg)
 		}
-		w.Flush()
-		fmt.Printf("\n")
-		var input string
-		var index int
-		for {
-			fmt.Print("请输入账号对应的序号进入相关操作: ")
-			_, err := fmt.Scanln(&input)
-			if err != nil {
-				return
+	} else if message.ReplyToMessage != nil {
+		state, exists := getUserState(message.Chat.ID)
+		if exists {
+			switch state.Action {
+			case "resizing_boot_volume":
+				handleResizeBootVolume(message.Chat.ID, state.InstanceIndex, message.Text)
 			}
-			if strings.EqualFold(input, "oci") {
-				multiBatchLaunchInstances()
-				listOracleAccount()
-				return
-			} else if strings.EqualFold(input, "ip") {
-				multiBatchListInstancesIp()
-				listOracleAccount()
-				return
-			}
-			index, _ = strconv.Atoi(input)
-			if 0 < index && index <= len(oracleSections) {
-				break
-			} else {
-				index = 0
-				input = ""
-				fmt.Printf("\033[1;31m错误! 请输入正确的序号\033[0m\n")
-			}
+			clearUserState(message.Chat.ID)
 		}
-		oracleSection = oracleSections[index-1]
 	}
 
-	var err error
-	//ctx = context.Background()
-	err = initVar(oracleSection)
+}
+func handleResizeBootVolume(chatID int64, volumeIndex int, sizeText string) {
+	size, err := strconv.ParseInt(sizeText, 10, 64)
 	if err != nil {
+		sendErrorMessage(chatID, "输入的大小无效，请输入一个整数")
 		return
 	}
+
+	var bootVolumes []core.BootVolume
+	for _, ad := range availabilityDomains {
+		volumes, _ := getBootVolumes(ad.Name)
+		bootVolumes = append(bootVolumes, volumes...)
+	}
+
+	if volumeIndex < 0 || volumeIndex >= len(bootVolumes) {
+		sendErrorMessage(chatID, "无效的引导卷索引")
+		return
+	}
+
+	volume := bootVolumes[volumeIndex]
+	_, err = updateBootVolume(volume.Id, &size, nil)
+	if err != nil {
+		sendErrorMessage(chatID, "调整引导卷大小失败: "+err.Error())
+	} else {
+		msg := tgbotapi.NewMessage(chatID, fmt.Sprintf("引导卷 '%s' 的大小已成功调整为 %d GB", *volume.DisplayName, size))
+		bot.Send(msg)
+	}
+
+	// 调整后，重新显示引导卷详情
+	manageBootVolumesTelegram(chatID)
+}
+func updateNewInstance(newInstance Instance) {
+	instanceMutex.Lock()
+	defer instanceMutex.Unlock()
+	instance = newInstance
+}
+func getCurrentRenamingInstanceIndex(chatID int64) int {
+	state, exists := getUserState(chatID)
+	if !exists || state.Action != "renaming" {
+		return -1 // 表示没有正在进行的重命名操作
+	}
+	return state.InstanceIndex
+}
+func setUserState(chatID int64, action string, instanceIndex int) {
+	stateMutex.Lock()
+	defer stateMutex.Unlock()
+	userStates[chatID] = UserState{
+		Action:        action,
+		InstanceIndex: instanceIndex,
+	}
+}
+
+type UserState struct {
+	Action        string // 例如 "renaming", "upgrading"
+	InstanceIndex int
+}
+
+var (
+	userStates = make(map[int64]UserState)
+	stateMutex sync.Mutex
+)
+
+func getUserState(chatID int64) (UserState, bool) {
+	stateMutex.Lock()
+	defer stateMutex.Unlock()
+	state, exists := userStates[chatID]
+	return state, exists
+}
+
+func clearUserState(chatID int64) {
+	stateMutex.Lock()
+	defer stateMutex.Unlock()
+	delete(userStates, chatID)
+}
+func getCurrentUpgradingInstanceIndex(chatID int64) int {
+	state, exists := getUserState(chatID)
+	if !exists || state.Action != "upgrading" {
+		return -1 // 表示没有正在进行的升级操作
+	}
+	return state.InstanceIndex
+}
+func getInstanceCopy() Instance {
+	instanceMutex.Lock()
+	defer instanceMutex.Unlock()
+	return instance
+}
+func terminateInstanceAction(chatID int64, instanceIndex int) {
+	instances, _, err := ListInstances(ctx, computeClient, nil)
+	if err != nil || instanceIndex >= len(instances) {
+		sendErrorMessage(chatID, "获取实例信息失败或实例索引无效")
+		return
+	}
+
+	instance := instances[instanceIndex]
+	err = terminateInstance(instance.Id)
+	if err != nil {
+		sendErrorMessage(chatID, "终止实例失败: "+err.Error())
+	} else {
+		msg := tgbotapi.NewMessage(chatID, "正在终止实例，请稍后查看实例状态")
+		bot.Send(msg)
+	}
+}
+
+func changePublicIpAction(chatID int64, instanceIndex int) {
+	instances, _, err := ListInstances(ctx, computeClient, nil)
+	if err != nil || instanceIndex >= len(instances) {
+		sendErrorMessage(chatID, "获取实例信息失败或实例索引无效")
+		return
+	}
+
+	instance := instances[instanceIndex]
+	vnics, err := getInstanceVnics(instance.Id)
+	if err != nil {
+		sendErrorMessage(chatID, "获取实例VNIC失败: "+err.Error())
+		return
+	}
+
+	publicIp, err := changePublicIp(vnics)
+	if err != nil {
+		sendErrorMessage(chatID, "更换公共IP失败: "+err.Error())
+	} else {
+		msg := tgbotapi.NewMessage(chatID, fmt.Sprintf("更换公共IP成功，新的IP地址: %s", *publicIp.IpAddress))
+		bot.Send(msg)
+	}
+}
+
+func configureAgentAction(chatID int64, instanceIndex int, action string) {
+	instances, _, err := ListInstances(ctx, computeClient, nil)
+	if err != nil || instanceIndex >= len(instances) {
+		sendErrorMessage(chatID, "获取实例信息失败或实例索引无效")
+		return
+	}
+
+	instance := instances[instanceIndex]
+	var disable bool
+	if action == "disable" {
+		disable = true
+	} else {
+		disable = false
+	}
+
+	_, err = updateInstance(instance.Id, nil, nil, nil, instance.AgentConfig.PluginsConfig, &disable)
+	if err != nil {
+		sendErrorMessage(chatID, fmt.Sprintf("%s管理和监控插件失败: %s", action, err.Error()))
+	} else {
+		msg := tgbotapi.NewMessage(chatID, fmt.Sprintf("%s管理和监控插件成功", action))
+		bot.Send(msg)
+	}
+}
+
+func handleCallback(callback *tgbotapi.CallbackQuery) {
+	callbackMutex.Lock()
+	defer callbackMutex.Unlock()
+
+	// 检查是否是重复的回调
+	if callback.ID == lastCallbackID {
+		return
+	}
+	lastCallbackID = callback.ID
+
+	data := callback.Data
+	chatID := callback.Message.Chat.ID
+
+	// 处理特定前缀的回调
+	if handled := handlePrefixedCallbacks(data, chatID); handled {
+		return
+	}
+
+	// 处理特定的回调数据
+	switch data {
+	case "list_accounts":
+		sendAccountList(chatID)
+	case "main_menu":
+		sendMainMenu(chatID)
+	case "confirm_create_instance":
+		startCreateInstance(chatID)
+	default:
+		handleRemainingCallbacks(data, chatID)
+	}
+}
+func handleDetachBootVolume(chatID int64, volumeIndex int) {
+	var bootVolumes []core.BootVolume
+	for _, ad := range availabilityDomains {
+		volumes, _ := getBootVolumes(ad.Name)
+		bootVolumes = append(bootVolumes, volumes...)
+	}
+
+	if volumeIndex < 0 || volumeIndex >= len(bootVolumes) {
+		sendErrorMessage(chatID, "无效的引导卷索引")
+		return
+	}
+
+	volume := bootVolumes[volumeIndex]
+	attachments, err := listBootVolumeAttachments(volume.AvailabilityDomain, volume.CompartmentId, volume.Id)
+	if err != nil {
+		sendErrorMessage(chatID, "获取引导卷附件失败: "+err.Error())
+		return
+	}
+
+	for _, attachment := range attachments {
+		_, err := detachBootVolume(attachment.Id)
+		if err != nil {
+			sendErrorMessage(chatID, "分离引导卷失败: "+err.Error())
+		} else {
+			msg := tgbotapi.NewMessage(chatID, fmt.Sprintf("已成功分离引导卷 '%s'", *volume.DisplayName))
+			bot.Send(msg)
+		}
+	}
+
+	// 分离后，重新显示引导卷详情
+	manageBootVolumesTelegram(chatID)
+
+}
+
+func handleTerminateBootVolume(chatID int64, volumeIndex int) {
+	var bootVolumes []core.BootVolume
+	for _, ad := range availabilityDomains {
+		volumes, _ := getBootVolumes(ad.Name)
+		bootVolumes = append(bootVolumes, volumes...)
+	}
+
+	if volumeIndex < 0 || volumeIndex >= len(bootVolumes) {
+		sendErrorMessage(chatID, "无效的引导卷索引")
+		return
+	}
+
+	volume := bootVolumes[volumeIndex]
+	_, err := deleteBootVolume(volume.Id)
+	if err != nil {
+		sendErrorMessage(chatID, "终止引导卷失败: "+err.Error())
+	} else {
+		msg := tgbotapi.NewMessage(chatID, fmt.Sprintf("已成功终止引导卷 '%s'", *volume.DisplayName))
+		bot.Send(msg)
+	}
+
+	// 终止后，返回到引导卷列表
+	manageBootVolumesTelegram(chatID)
+}
+func handleBootVolumePerformance(chatID int64, volumeIndex int, performance int64) {
+	var bootVolumes []core.BootVolume
+	for _, ad := range availabilityDomains {
+		volumes, _ := getBootVolumes(ad.Name)
+		bootVolumes = append(bootVolumes, volumes...)
+	}
+
+	if volumeIndex < 0 || volumeIndex >= len(bootVolumes) {
+		sendErrorMessage(chatID, "无效的引导卷索引")
+		return
+	}
+
+	volume := bootVolumes[volumeIndex]
+	_, err := updateBootVolume(volume.Id, nil, &performance)
+	if err != nil {
+		sendErrorMessage(chatID, "调整引导卷性能失败: "+err.Error())
+	} else {
+		msg := tgbotapi.NewMessage(chatID, fmt.Sprintf("引导卷 '%s' 的性能已成功调整为 %d VPUs/GB", *volume.DisplayName, performance))
+		bot.Send(msg)
+	}
+
+	// 调整后，重新显示引导卷详情
+	manageBootVolumesTelegram(chatID)
+}
+func handlePrefixedCallbacks(data string, chatID int64) bool {
+	switch {
+	case strings.HasPrefix(data, "create_instance:"):
+		index, _ := strconv.Atoi(strings.TrimPrefix(data, "create_instance:"))
+		confirmCreateInstance(chatID, index)
+	case strings.HasPrefix(data, "instance_action:"):
+		parts := strings.Split(data, ":")
+		if len(parts) == 3 {
+			instanceIndex, _ := strconv.Atoi(parts[1])
+			action := parts[2]
+			handleInstanceAction(chatID, instanceIndex, action)
+		}
+	case strings.HasPrefix(data, "confirm_terminate:"):
+		instanceIndex, _ := strconv.Atoi(strings.TrimPrefix(data, "confirm_terminate:"))
+		terminateInstanceAction(chatID, instanceIndex)
+	case strings.HasPrefix(data, "confirm_change_ip:"):
+		instanceIndex, _ := strconv.Atoi(strings.TrimPrefix(data, "confirm_change_ip:"))
+		changePublicIpAction(chatID, instanceIndex)
+	case strings.HasPrefix(data, "agent_config:"):
+		parts := strings.Split(data, ":")
+		if len(parts) == 3 {
+			instanceIndex, _ := strconv.Atoi(parts[1])
+			action := parts[2]
+			configureAgentAction(chatID, instanceIndex, action)
+		}
+	case strings.HasPrefix(data, "boot_volume_performance:"):
+		parts := strings.Split(data, ":")
+		if len(parts) == 3 {
+			volumeIndex, _ := strconv.Atoi(parts[1])
+			performance, _ := strconv.ParseInt(parts[2], 10, 64)
+			handleBootVolumePerformance(chatID, volumeIndex, performance)
+		}
+	case strings.HasPrefix(data, "confirm_terminate_boot_volume:"):
+		volumeIndex, _ := strconv.Atoi(strings.TrimPrefix(data, "confirm_terminate_boot_volume:"))
+		handleTerminateBootVolume(chatID, volumeIndex)
+	default:
+		return false
+	}
+	return true
+}
+
+func handleRemainingCallbacks(data string, chatID int64) {
+	switch {
+	case strings.HasPrefix(data, "select_account:"):
+		accountIndex, _ := strconv.Atoi(strings.TrimPrefix(data, "select_account:"))
+		selectAccount(chatID, accountIndex)
+	case strings.HasPrefix(data, "account_action:"):
+		action := strings.TrimPrefix(data, "account_action:")
+		handleAccountAction(chatID, action)
+	case strings.HasPrefix(data, "instance_details:"):
+		instanceIndex, _ := strconv.Atoi(strings.TrimPrefix(data, "instance_details:"))
+		showInstanceDetails(chatID, instanceIndex)
+	case strings.HasPrefix(data, "boot_volume_details:"):
+		volumeIndex, _ := strconv.Atoi(strings.TrimPrefix(data, "boot_volume_details:"))
+		showBootVolumeDetails(chatID, volumeIndex)
+	case strings.HasPrefix(data, "boot_volume_action:"):
+		parts := strings.Split(data, ":")
+		if len(parts) == 3 {
+			volumeIndex, _ := strconv.Atoi(parts[1])
+			action := parts[2]
+			handleBootVolumeAction(chatID, volumeIndex, action)
+		}
+	default:
+		log.Printf("未知的回调数据: %s", data)
+	}
+}
+func viewCostTelegram(chatID int64) {
+	msg := tgbotapi.NewMessage(chatID, "正在获取成本数据...")
+	sentMsg, _ := bot.Send(msg)
+
+	usageapiClient, err := usageapi.NewUsageapiClientWithConfigurationProvider(provider)
+	if err != nil {
+		editMsg := tgbotapi.NewEditMessageText(chatID, sentMsg.MessageID, "创建 UsageapiClient 失败: "+err.Error())
+		bot.Send(editMsg)
+		return
+	}
+
+	firstDay, lastDay := currMouthFirstLastDay()
+	tenancyOCID, err := provider.TenancyOCID()
+	if err != nil {
+		editMsg := tgbotapi.NewEditMessageText(chatID, sentMsg.MessageID, "获取 Tenancy OCID 失败: "+err.Error())
+		bot.Send(editMsg)
+		return
+	}
+
+	req := usageapi.RequestSummarizedUsagesRequest{
+		RequestSummarizedUsagesDetails: usageapi.RequestSummarizedUsagesDetails{
+			CompartmentDepth: common.Float32(6),
+			Granularity:      usageapi.RequestSummarizedUsagesDetailsGranularityMonthly,
+			GroupBy:          []string{"service"},
+			QueryType:        usageapi.RequestSummarizedUsagesDetailsQueryTypeUsage,
+			TenantId:         &tenancyOCID,
+			TimeUsageStarted: &common.SDKTime{Time: firstDay},
+			TimeUsageEnded:   &common.SDKTime{Time: lastDay},
+		},
+	}
+
+	resp, err := usageapiClient.RequestSummarizedUsages(context.Background(), req)
+	if err != nil {
+		editMsg := tgbotapi.NewEditMessageText(chatID, sentMsg.MessageID, "获取成本数据失败: "+err.Error())
+		bot.Send(editMsg)
+		return
+	}
+
+	var messageText strings.Builder
+	messageText.WriteString("本月成本概览：\n\n")
+
+	var totalCost float32
+	for _, item := range resp.Items {
+		if item.Service == nil || item.Unit == nil || item.ComputedAmount == nil || item.ComputedQuantity == nil {
+			continue // 跳过无效的数据
+		}
+		cost := *item.ComputedAmount
+		totalCost += cost
+		messageText.WriteString(fmt.Sprintf("[服务: %s] 单位: %s 费用: %.2f 使用量: %.2f\n",
+			*item.Service, *item.Unit, *item.ComputedAmount, *item.ComputedQuantity))
+	}
+
+	messageText.WriteString(fmt.Sprintf("\n总成本: %.2f\n", totalCost))
+
+	keyboard := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("返回", "select_account:"+strconv.Itoa(getCurrentAccountIndex())),
+		),
+	)
+
+	editMsg := tgbotapi.NewEditMessageText(chatID, sentMsg.MessageID, messageText.String())
+	editMsg.ReplyMarkup = &keyboard
+	bot.Send(editMsg)
+}
+
+func showBootVolumeDetails(chatID int64, volumeIndex int) {
+	var bootVolumes []core.BootVolume
+	for _, ad := range availabilityDomains {
+		volumes, _ := getBootVolumes(ad.Name)
+		bootVolumes = append(bootVolumes, volumes...)
+	}
+
+	if volumeIndex < 0 || volumeIndex >= len(bootVolumes) {
+		msg := tgbotapi.NewMessage(chatID, "无效的引导卷索引")
+		bot.Send(msg)
+		return
+	}
+
+	volume := bootVolumes[volumeIndex]
+
+	attachments, _ := listBootVolumeAttachments(volume.AvailabilityDomain, volume.CompartmentId, volume.Id)
+	attachIns := make([]string, 0)
+	for _, attachment := range attachments {
+		ins, err := getInstance(attachment.InstanceId)
+		if err != nil {
+			attachIns = append(attachIns, err.Error())
+		} else {
+			attachIns = append(attachIns, *ins.DisplayName)
+		}
+	}
+
+	var performance string
+	switch *volume.VpusPerGB {
+	case 10:
+		performance = fmt.Sprintf("均衡 (VPU:%d)", *volume.VpusPerGB)
+	case 20:
+		performance = fmt.Sprintf("性能较高 (VPU:%d)", *volume.VpusPerGB)
+	default:
+		performance = fmt.Sprintf("UHP (VPU:%d)", *volume.VpusPerGB)
+	}
+
+	var messageText strings.Builder
+	messageText.WriteString(fmt.Sprintf("引导卷详情：\n\n"))
+	messageText.WriteString(fmt.Sprintf("名称: %s\n", *volume.DisplayName))
+	messageText.WriteString(fmt.Sprintf("状态: %s\n", getBootVolumeState(volume.LifecycleState)))
+	messageText.WriteString(fmt.Sprintf("OCID: %s\n", *volume.Id))
+	messageText.WriteString(fmt.Sprintf("大小: %d GB\n", *volume.SizeInGBs))
+	messageText.WriteString(fmt.Sprintf("可用性域: %s\n", *volume.AvailabilityDomain))
+	messageText.WriteString(fmt.Sprintf("性能: %s\n", performance))
+	messageText.WriteString(fmt.Sprintf("附加的实例: %s\n", strings.Join(attachIns, ", ")))
+
+	keyboard := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("修改性能", fmt.Sprintf("boot_volume_action:%d:performance", volumeIndex)),
+			tgbotapi.NewInlineKeyboardButtonData("修改大小", fmt.Sprintf("boot_volume_action:%d:resize", volumeIndex)),
+		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("分离引导卷", fmt.Sprintf("boot_volume_action:%d:detach", volumeIndex)),
+			tgbotapi.NewInlineKeyboardButtonData("终止引导卷", fmt.Sprintf("boot_volume_action:%d:terminate", volumeIndex)),
+		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("返回引导卷列表", "account_action:manage_boot_volumes"),
+		),
+	)
+
+	msg := tgbotapi.NewMessage(chatID, messageText.String())
+	msg.ReplyMarkup = keyboard
+	bot.Send(msg)
+}
+
+func handleBootVolumeAction(chatID int64, volumeIndex int, action string) {
+	var bootVolumes []core.BootVolume
+	for _, ad := range availabilityDomains {
+		volumes, _ := getBootVolumes(ad.Name)
+		bootVolumes = append(bootVolumes, volumes...)
+	}
+
+	if volumeIndex < 0 || volumeIndex >= len(bootVolumes) {
+		msg := tgbotapi.NewMessage(chatID, "无效的引导卷索引")
+		bot.Send(msg)
+		return
+	}
+
+	volume := bootVolumes[volumeIndex]
+
+	switch action {
+	case "performance":
+		keyboard := tgbotapi.NewInlineKeyboardMarkup(
+			tgbotapi.NewInlineKeyboardRow(
+				tgbotapi.NewInlineKeyboardButtonData("均衡", fmt.Sprintf("boot_volume_performance:%d:10", volumeIndex)),
+				tgbotapi.NewInlineKeyboardButtonData("高性能", fmt.Sprintf("boot_volume_performance:%d:20", volumeIndex)),
+			),
+			tgbotapi.NewInlineKeyboardRow(
+				tgbotapi.NewInlineKeyboardButtonData("返回", fmt.Sprintf("boot_volume_details:%d", volumeIndex)),
+			),
+		)
+		msg := tgbotapi.NewMessage(chatID, fmt.Sprintf("当前引导卷性能：%d VPUs/GB\n请选择新的引导卷性能：", *volume.VpusPerGB))
+		msg.ReplyMarkup = keyboard
+		bot.Send(msg)
+	case "resize":
+		msg := tgbotapi.NewMessage(chatID, fmt.Sprintf("当前引导卷大小：%d GB\n请输入新的引导卷大小（GB）：", *volume.SizeInGBs))
+		msg.ReplyMarkup = tgbotapi.ForceReply{ForceReply: true, Selective: true}
+		bot.Send(msg)
+		setUserState(chatID, "resizing_boot_volume", volumeIndex)
+	case "detach":
+		confirmDetachBootVolume(chatID, volumeIndex)
+	case "terminate":
+		confirmTerminateBootVolume(chatID, volumeIndex)
+	default:
+		msg := tgbotapi.NewMessage(chatID, "未知的操作")
+		bot.Send(msg)
+	}
+}
+func confirmDetachBootVolume(chatID int64, volumeIndex int) {
+	keyboard := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("确认分离", fmt.Sprintf("confirm_detach_boot_volume:%d", volumeIndex)),
+			tgbotapi.NewInlineKeyboardButtonData("取消", fmt.Sprintf("boot_volume_details:%d", volumeIndex)),
+		),
+	)
+	msg := tgbotapi.NewMessage(chatID, "确定要分离此引导卷吗？")
+	msg.ReplyMarkup = keyboard
+	bot.Send(msg)
+}
+
+func confirmTerminateBootVolume(chatID int64, volumeIndex int) {
+	keyboard := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("确认终止", fmt.Sprintf("confirm_terminate_boot_volume:%d", volumeIndex)),
+			tgbotapi.NewInlineKeyboardButtonData("取消", fmt.Sprintf("boot_volume_details:%d", volumeIndex)),
+		),
+	)
+	msg := tgbotapi.NewMessage(chatID, "确定要终止此引导卷吗？此操作不可逆。")
+	msg.ReplyMarkup = keyboard
+	bot.Send(msg)
+}
+func manageBootVolumesTelegram(chatID int64) {
+	msg := tgbotapi.NewMessage(chatID, "正在获取引导卷数据...")
+	sentMsg, _ := bot.Send(msg)
+
+	var bootVolumes []core.BootVolume
+	var wg sync.WaitGroup
+	var mu sync.Mutex // 用于保护 bootVolumes 切片
+	errorChan := make(chan error, len(availabilityDomains))
+
+	for _, ad := range availabilityDomains {
+		wg.Add(1)
+		go func(adName *string) {
+			defer wg.Done()
+			volumes, err := getBootVolumes(adName)
+			if err != nil {
+				errorChan <- fmt.Errorf("获取可用性域 %s 的引导卷失败: %v", *adName, err)
+			} else {
+				mu.Lock()
+				bootVolumes = append(bootVolumes, volumes...)
+				mu.Unlock()
+			}
+		}(ad.Name)
+	}
+	wg.Wait()
+	close(errorChan)
+
+	// 收集所有错误
+	var errorMessages []string
+	for err := range errorChan {
+		errorMessages = append(errorMessages, err.Error())
+	}
+
+	if len(bootVolumes) == 0 {
+		var messageText string
+		if len(errorMessages) > 0 {
+			messageText = fmt.Sprintf("获取引导卷时出现错误:\n%s\n\n没有找到任何引导卷。", strings.Join(errorMessages, "\n"))
+		} else {
+			messageText = "没有找到任何引导卷。可能是因为当前账户下没有创建引导卷，或所有引导卷都已被附加到实例上。"
+		}
+		editMsg := tgbotapi.NewEditMessageText(chatID, sentMsg.MessageID, messageText)
+		bot.Send(editMsg)
+
+		// 添加一个返回按钮
+		keyboard := tgbotapi.NewInlineKeyboardMarkup(
+			tgbotapi.NewInlineKeyboardRow(
+				tgbotapi.NewInlineKeyboardButtonData("返回", "select_account:"+strconv.Itoa(getCurrentAccountIndex())),
+			),
+		)
+		editMsg.ReplyMarkup = &keyboard
+		bot.Send(editMsg)
+		return
+	}
+
+	// 剩余的代码保持不变
+	var messageText strings.Builder
+	messageText.WriteString(fmt.Sprintf("引导卷 (当前账号: %s)\n\n", oracleSection.Name()))
+	messageText.WriteString(fmt.Sprintf("%-5s %-30s %-15s %-10s\n", "序号", "名称", "状态", "大小(GB)"))
+
+	var keyboard [][]tgbotapi.InlineKeyboardButton
+
+	for i, volume := range bootVolumes {
+		messageText.WriteString(fmt.Sprintf("%-5d %-30s %-15s %-10d\n",
+			i+1,
+			*volume.DisplayName,
+			getBootVolumeState(volume.LifecycleState),
+			*volume.SizeInGBs))
+
+		button := tgbotapi.NewInlineKeyboardButtonData(
+			fmt.Sprintf("引导卷 %d", i+1),
+			fmt.Sprintf("boot_volume_details:%d", i))
+		row := tgbotapi.NewInlineKeyboardRow(button)
+		keyboard = append(keyboard, row)
+	}
+
+	keyboard = append(keyboard, tgbotapi.NewInlineKeyboardRow(
+		tgbotapi.NewInlineKeyboardButtonData("返回", "select_account:"+strconv.Itoa(getCurrentAccountIndex())),
+	))
+
+	editMsg := tgbotapi.NewEditMessageText(chatID, sentMsg.MessageID, messageText.String())
+	editMsg.ParseMode = "Markdown"
+	editMsg.ReplyMarkup = &tgbotapi.InlineKeyboardMarkup{InlineKeyboard: keyboard}
+	bot.Send(editMsg)
+}
+func handleInstanceAction(chatID int64, instanceIndex int, action string) {
+	instances, _, err := ListInstances(ctx, computeClient, nil)
+	if err != nil || instanceIndex >= len(instances) {
+		sendErrorMessage(chatID, "获取实例信息失败或实例索引无效")
+		return
+	}
+
+	instance := instances[instanceIndex]
+
+	switch action {
+	case "start":
+		_, err := instanceAction(instance.Id, core.InstanceActionActionStart)
+		sendActionResult(chatID, "启动实例", err)
+	case "stop":
+		_, err := instanceAction(instance.Id, core.InstanceActionActionSoftstop)
+		sendActionResult(chatID, "停止实例", err)
+	case "reset":
+		_, err := instanceAction(instance.Id, core.InstanceActionActionSoftreset)
+		sendActionResult(chatID, "重启实例", err)
+	case "terminate":
+		confirmTerminateInstance(chatID, instanceIndex)
+	case "change_ip":
+		confirmChangePublicIp(chatID, instanceIndex)
+	case "agent_config":
+		promptAgentConfig(chatID, instanceIndex)
+	default:
+		sendErrorMessage(chatID, "未知的实例操作")
+	}
+}
+func sendActionResult(chatID int64, action string, err error) {
+	var message string
+	if err != nil {
+		message = fmt.Sprintf("%s失败: %s", action, err.Error())
+	} else {
+		message = fmt.Sprintf("%s成功，请稍后查看实例状态", action)
+	}
+	msg := tgbotapi.NewMessage(chatID, message)
+	bot.Send(msg)
+}
+func sendErrorMessage(chatID int64, message string) {
+	msg := tgbotapi.NewMessage(chatID, "错误: "+message)
+	bot.Send(msg)
+}
+
+func confirmTerminateInstance(chatID int64, instanceIndex int) {
+	keyboard := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("确认终止", fmt.Sprintf("confirm_terminate:%d", instanceIndex)),
+			tgbotapi.NewInlineKeyboardButtonData("取消", fmt.Sprintf("instance_details:%d", instanceIndex)),
+		),
+	)
+	msg := tgbotapi.NewMessage(chatID, "您确定要终止此实例吗？此操作不可逆。")
+	msg.ReplyMarkup = keyboard
+	bot.Send(msg)
+}
+
+func confirmChangePublicIp(chatID int64, instanceIndex int) {
+	keyboard := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("确认更换", fmt.Sprintf("confirm_change_ip:%d", instanceIndex)),
+			tgbotapi.NewInlineKeyboardButtonData("取消", fmt.Sprintf("instance_details:%d", instanceIndex)),
+		),
+	)
+	msg := tgbotapi.NewMessage(chatID, "确定要更换此实例的公共IP吗？这将删除当前的公共IP并创建一个新的。")
+	msg.ReplyMarkup = keyboard
+	bot.Send(msg)
+}
+
+func promptAgentConfig(chatID int64, instanceIndex int) {
+	keyboard := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("启用插件", fmt.Sprintf("agent_config:%d:enable", instanceIndex)),
+			tgbotapi.NewInlineKeyboardButtonData("禁用插件", fmt.Sprintf("agent_config:%d:disable", instanceIndex)),
+		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("返回", fmt.Sprintf("instance_details:%d", instanceIndex)),
+		),
+	)
+	msg := tgbotapi.NewMessage(chatID, "请选择 Oracle Cloud Agent 插件配置:")
+	msg.ReplyMarkup = keyboard
+	bot.Send(msg)
+}
+func showInstanceDetails(chatID int64, instanceIndex int) {
+	msg := tgbotapi.NewMessage(chatID, "正在获取实例详细信息...")
+	sentMsg, _ := bot.Send(msg)
+
+	instances, _, err := ListInstances(ctx, computeClient, nil)
+	if err != nil || instanceIndex >= len(instances) {
+		editMsg := tgbotapi.NewEditMessageText(chatID, sentMsg.MessageID, "获取实例信息失败或实例索引无效")
+		bot.Send(editMsg)
+		return
+	}
+
+	instance := instances[instanceIndex]
+	vnics, err := getInstanceVnics(instance.Id)
+	if err != nil {
+		editMsg := tgbotapi.NewEditMessageText(chatID, sentMsg.MessageID, "获取实例VNIC失败: "+err.Error())
+		bot.Send(editMsg)
+		return
+	}
+
+	var publicIps []string
+	for _, vnic := range vnics {
+		if vnic.PublicIp != nil {
+			publicIps = append(publicIps, *vnic.PublicIp)
+		}
+	}
+	strPublicIps := strings.Join(publicIps, ", ")
+
+	var messageText strings.Builder
+	messageText.WriteString(fmt.Sprintf("实例详细信息 (当前账号: %s)\n\n", oracleSectionName))
+	messageText.WriteString(fmt.Sprintf("名称: %s\n", *instance.DisplayName))
+	messageText.WriteString(fmt.Sprintf("状态: %s\n", getInstanceState(instance.LifecycleState)))
+	messageText.WriteString(fmt.Sprintf("公共IP: %s\n", strPublicIps))
+	messageText.WriteString(fmt.Sprintf("可用性域: %s\n", *instance.AvailabilityDomain))
+	messageText.WriteString(fmt.Sprintf("配置: %s\n", *instance.Shape))
+	messageText.WriteString(fmt.Sprintf("OCPU计数: %g\n", *instance.ShapeConfig.Ocpus))
+	messageText.WriteString(fmt.Sprintf("网络带宽(Gbps): %g\n", *instance.ShapeConfig.NetworkingBandwidthInGbps))
+	messageText.WriteString(fmt.Sprintf("内存(GB): %g\n\n", *instance.ShapeConfig.MemoryInGBs))
+	messageText.WriteString("Oracle Cloud Agent 插件配置情况\n")
+	messageText.WriteString(fmt.Sprintf("监控插件已禁用？: %t\n", *instance.AgentConfig.IsMonitoringDisabled))
+	messageText.WriteString(fmt.Sprintf("管理插件已禁用？: %t\n", *instance.AgentConfig.IsManagementDisabled))
+	messageText.WriteString(fmt.Sprintf("所有插件均已禁用？: %t\n", *instance.AgentConfig.AreAllPluginsDisabled))
+	for _, value := range instance.AgentConfig.PluginsConfig {
+		messageText.WriteString(fmt.Sprintf("%s: %s\n", *value.Name, value.DesiredState))
+	}
+
+	keyboard := [][]tgbotapi.InlineKeyboardButton{
+		{
+			tgbotapi.NewInlineKeyboardButtonData("启动", fmt.Sprintf("instance_action:%d:start", instanceIndex)),
+			tgbotapi.NewInlineKeyboardButtonData("停止", fmt.Sprintf("instance_action:%d:stop", instanceIndex)),
+			tgbotapi.NewInlineKeyboardButtonData("重启", fmt.Sprintf("instance_action:%d:reset", instanceIndex)),
+		},
+		{
+			tgbotapi.NewInlineKeyboardButtonData("终止", fmt.Sprintf("instance_action:%d:terminate", instanceIndex)),
+			tgbotapi.NewInlineKeyboardButtonData("更换公共IP", fmt.Sprintf("instance_action:%d:change_ip", instanceIndex)),
+		},
+		{
+			tgbotapi.NewInlineKeyboardButtonData("Agent插件配置", fmt.Sprintf("instance_action:%d:agent_config", instanceIndex)),
+		},
+		{
+			tgbotapi.NewInlineKeyboardButtonData("返回实例列表", "account_action:list_instances"),
+		},
+	}
+
+	editMsg := tgbotapi.NewEditMessageText(chatID, sentMsg.MessageID, messageText.String())
+	editMsg.ReplyMarkup = &tgbotapi.InlineKeyboardMarkup{InlineKeyboard: keyboard}
+	bot.Send(editMsg)
+}
+func createInstanceTelegram(chatID int64) {
+	msg := tgbotapi.NewMessage(chatID, "正在获取可用性域和实例模板...")
+	sentMsg, _ := bot.Send(msg)
+
 	// 获取可用性域
-	fmt.Println("正在获取可用性域...")
+	var err error
 	availabilityDomains, err = ListAvailabilityDomains()
 	if err != nil {
-		printlnErr("获取可用性域失败", err.Error())
+		editMsg := tgbotapi.NewEditMessageText(chatID, sentMsg.MessageID, "获取可用性域失败: "+err.Error())
+		bot.Send(editMsg)
 		return
 	}
 
-	//getUsers()
+	if len(availabilityDomains) == 0 {
+		editMsg := tgbotapi.NewEditMessageText(chatID, sentMsg.MessageID, "没有可用的可用性域")
+		bot.Send(editMsg)
+		return
+	}
 
-	showMainMenu()
+	var instanceSections []*ini.Section
+	instanceSections = append(instanceSections, instanceBaseSection.ChildSections()...)
+	instanceSections = append(instanceSections, oracleSection.ChildSections()...)
+
+	if len(instanceSections) == 0 {
+		editMsg := tgbotapi.NewEditMessageText(chatID, sentMsg.MessageID, "未找到实例模板")
+		bot.Send(editMsg)
+		return
+	}
+
+	var messageText strings.Builder
+	messageText.WriteString(fmt.Sprintf("选择对应的实例模板开始创建实例 (当前账号: %s)\n\n", oracleSectionName))
+	messageText.WriteString(fmt.Sprintf("%-5s %-20s %-10s %-10s\n", "序号", "配置", "CPU个数", "内存(GB)"))
+
+	var keyboard [][]tgbotapi.InlineKeyboardButton
+
+	for i, instanceSec := range instanceSections {
+		cpu := instanceSec.Key("cpus").Value()
+		if cpu == "" {
+			cpu = "-"
+		}
+		memory := instanceSec.Key("memoryInGBs").Value()
+		if memory == "" {
+			memory = "-"
+		}
+		shape := instanceSec.Key("shape").Value()
+
+		messageText.WriteString(fmt.Sprintf("%-5d %-20s %-10s %-10s\n", i+1, shape, cpu, memory))
+
+		button := tgbotapi.NewInlineKeyboardButtonData(
+			fmt.Sprintf("模板 %d", i+1),
+			fmt.Sprintf("create_instance:%d", i))
+		row := tgbotapi.NewInlineKeyboardRow(button)
+		keyboard = append(keyboard, row)
+	}
+
+	keyboard = append(keyboard, tgbotapi.NewInlineKeyboardRow(
+		tgbotapi.NewInlineKeyboardButtonData("返回", "select_account:"+strconv.Itoa(getCurrentAccountIndex())),
+	))
+
+	editMsg := tgbotapi.NewEditMessageText(chatID, sentMsg.MessageID, messageText.String())
+	editMsg.ParseMode = "Markdown"
+	editMsg.ReplyMarkup = &tgbotapi.InlineKeyboardMarkup{InlineKeyboard: keyboard}
+	bot.Send(editMsg)
+}
+
+func confirmCreateInstance(chatID int64, index int) {
+	var instanceSections []*ini.Section
+	instanceSections = append(instanceSections, instanceBaseSection.ChildSections()...)
+	instanceSections = append(instanceSections, oracleSection.ChildSections()...)
+
+	if index < 0 || index >= len(instanceSections) {
+		msg := tgbotapi.NewMessage(chatID, "无效的模板选择")
+		bot.Send(msg)
+		return
+	}
+
+	instanceSection := instanceSections[index]
+	var newInstance Instance
+	err := instanceSection.MapTo(&newInstance)
+	if err != nil {
+		msg := tgbotapi.NewMessage(chatID, "解析实例模板参数失败: "+err.Error())
+		bot.Send(msg)
+		return
+	}
+	updateNewInstance(newInstance)
+
+	// 如果实例模板中没有指定可用性域，则使用第一个可用的域
+	if instance.AvailabilityDomain == "" && len(availabilityDomains) > 0 {
+		instance.AvailabilityDomain = *availabilityDomains[0].Name
+	}
+
+	messageText := fmt.Sprintf("确认创建以下配置的实例：\n\n"+
+		"形状: %s\n"+
+		"CPU: %g\n"+
+		"内存: %g GB\n"+
+		"操作系统: %s %s\n"+
+		"引导卷大小: %d GB\n"+
+		"可用性域: %s\n\n"+
+		"是否确认创建？",
+		instance.Shape, instance.Ocpus, instance.MemoryInGBs,
+		instance.OperatingSystem, instance.OperatingSystemVersion,
+		instance.BootVolumeSizeInGBs, instance.AvailabilityDomain)
+
+	keyboard := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("确认创建", "confirm_create_instance"),
+			tgbotapi.NewInlineKeyboardButtonData("取消", "account_action:create_instance"),
+		),
+	)
+
+	msg := tgbotapi.NewMessage(chatID, messageText)
+	msg.ReplyMarkup = keyboard
+	bot.Send(msg)
+}
+
+func startCreateInstance(chatID int64) {
+	log.Printf("开始创建实例，chatID: %d", chatID)
+	msg := tgbotapi.NewMessage(chatID, "正在创建实例，请稍候...")
+	sentMsg, _ := bot.Send(msg)
+
+	getInstanceCopy()
+
+	sum, num := LaunchInstances(availabilityDomains)
+
+	log.Printf("创建实例完成，总数: %d, 成功: %d", sum, num)
+	resultMsg := fmt.Sprintf("创建实例结果：\n总数: %d\n成功: %d\n失败: %d", sum, num, sum-num)
+	editMsg := tgbotapi.NewEditMessageText(chatID, sentMsg.MessageID, resultMsg)
+
+	keyboard := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("返回实例列表", "account_action:list_instances"),
+			tgbotapi.NewInlineKeyboardButtonData("返回主菜单", "select_account:"+strconv.Itoa(getCurrentAccountIndex())),
+		),
+	)
+	editMsg.ReplyMarkup = &keyboard
+	bot.Send(editMsg)
+}
+func sendMainMenu(chatID int64) {
+	keyboard := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("选择账户", "list_accounts"),
+		),
+	)
+
+	msg := tgbotapi.NewMessage(chatID, "欢迎使用甲骨文实例管理工具，请选择操作：")
+	msg.ReplyMarkup = keyboard
+
+	bot.Send(msg)
+}
+
+func sendAccountList(chatID int64) {
+	var keyboard [][]tgbotapi.InlineKeyboardButton
+
+	for i, section := range oracleSections {
+		button := tgbotapi.NewInlineKeyboardButtonData(section.Name(), fmt.Sprintf("select_account:%d", i))
+		row := tgbotapi.NewInlineKeyboardRow(button)
+		keyboard = append(keyboard, row)
+	}
+
+	keyboard = append(keyboard, tgbotapi.NewInlineKeyboardRow(
+		tgbotapi.NewInlineKeyboardButtonData("返回主菜单", "main_menu"),
+	))
+
+	msg := tgbotapi.NewMessage(chatID, "请选择要操作的账户：")
+	msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(keyboard...)
+
+	bot.Send(msg)
+}
+
+func selectAccount(chatID int64, accountIndex int) {
+	if accountIndex < 0 || accountIndex >= len(oracleSections) {
+		msg := tgbotapi.NewMessage(chatID, "无效的账户选择")
+		bot.Send(msg)
+		return
+	}
+
+	oracleSection = oracleSections[accountIndex]
+	err := initVar(oracleSection)
+	if err != nil {
+		msg := tgbotapi.NewMessage(chatID, "初始化账户失败："+err.Error())
+		bot.Send(msg)
+		return
+	}
+
+	keyboard := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("查看实例", "account_action:list_instances"),
+			tgbotapi.NewInlineKeyboardButtonData("创建实例", "account_action:create_instance"),
+		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("管理引导卷", "account_action:manage_boot_volumes"),
+			tgbotapi.NewInlineKeyboardButtonData("查看成本", "account_action:view_cost"),
+		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("返回主菜单", "main_menu"),
+		),
+	)
+
+	msg := tgbotapi.NewMessage(chatID, fmt.Sprintf("已选择账户：%s\n请选择操作：", oracleSection.Name()))
+	msg.ReplyMarkup = keyboard
+
+	bot.Send(msg)
+}
+
+func handleAccountAction(chatID int64, action string) {
+	switch action {
+	case "list_instances":
+		listInstancesTelegram(chatID)
+	case "create_instance":
+		createInstanceTelegram(chatID)
+	case "manage_boot_volumes":
+		manageBootVolumesTelegram(chatID)
+	case "view_cost":
+		viewCostTelegram(chatID)
+	default:
+		msg := tgbotapi.NewMessage(chatID, "未知操作")
+		bot.Send(msg)
+	}
+}
+
+func listInstancesTelegram(chatID int64) {
+	msg := tgbotapi.NewMessage(chatID, "正在获取实例数据...")
+	sentMsg, _ := bot.Send(msg)
+
+	var instances []core.Instance
+	var nextPage *string
+	var err error
+	for {
+		var ins []core.Instance
+		ins, nextPage, err = ListInstances(ctx, computeClient, nextPage)
+		if err == nil {
+			instances = append(instances, ins...)
+		}
+		if nextPage == nil || len(ins) == 0 {
+			break
+		}
+	}
+
+	if err != nil {
+		editMsg := tgbotapi.NewEditMessageText(chatID, sentMsg.MessageID, "获取实例失败: "+err.Error())
+		bot.Send(editMsg)
+		return
+	}
+
+	if len(instances) == 0 {
+		editMsg := tgbotapi.NewEditMessageText(chatID, sentMsg.MessageID, "没有找到任何实例")
+		bot.Send(editMsg)
+		return
+	}
+
+	var messageText strings.Builder
+	messageText.WriteString("实例列表：\n\n")
+
+	var keyboard [][]tgbotapi.InlineKeyboardButton
+
+	for i, ins := range instances {
+		messageText.WriteString(fmt.Sprintf("%d. %s (状态: %s)\n", i+1, *ins.DisplayName, getInstanceState(ins.LifecycleState)))
+		button := tgbotapi.NewInlineKeyboardButtonData(fmt.Sprintf("实例 %d", i+1), fmt.Sprintf("instance_details:%d", i))
+		row := tgbotapi.NewInlineKeyboardRow(button)
+		keyboard = append(keyboard, row)
+	}
+
+	keyboard = append(keyboard, tgbotapi.NewInlineKeyboardRow(
+		tgbotapi.NewInlineKeyboardButtonData("返回", "select_account:"+strconv.Itoa(getCurrentAccountIndex())),
+	))
+
+	editMsg := tgbotapi.NewEditMessageText(chatID, sentMsg.MessageID, messageText.String())
+	editMsg.ReplyMarkup = &tgbotapi.InlineKeyboardMarkup{
+		InlineKeyboard: keyboard,
+	}
+	bot.Send(editMsg)
+}
+
+func getCurrentAccountIndex() int {
+	for i, section := range oracleSections {
+		if section == oracleSection {
+			return i
+		}
+	}
+	return -1
 }
 
 func initVar(oracleSec *ini.Section) (err error) {
@@ -262,738 +1259,12 @@ func initVar(oracleSec *ini.Section) (err error) {
 		return
 	}
 	setProxyOrNot(&identityClient.BaseClient)
-	return
-}
-
-func showMainMenu() {
-	fmt.Printf("\n\033[1;32m欢迎使用甲骨文实例管理工具\033[0m \n(当前账号: %s)\n\n", oracleSection.Name())
-	fmt.Printf("\033[1;36m%s\033[0m %s\n", "1.", "查看实例")
-	fmt.Printf("\033[1;36m%s\033[0m %s\n", "2.", "创建实例")
-	fmt.Printf("\033[1;36m%s\033[0m %s\n", "3.", "管理引导卷")
-	fmt.Print("\n请输入序号进入相关操作: ")
-	var input string
-	var num int
-	fmt.Scanln(&input)
-	if strings.EqualFold(input, "oci") {
-		batchLaunchInstances(oracleSection)
-		showMainMenu()
-		return
-	} else if strings.EqualFold(input, "ip") {
-		IPsFilePath := IPsFilePrefix + "-" + time.Now().Format("2006-01-02-150405.txt")
-		batchListInstancesIp(IPsFilePath, oracleSection)
-		showMainMenu()
-		return
-	}
-	num, _ = strconv.Atoi(input)
-	switch num {
-	case 1:
-		listInstances()
-	case 2:
-		listLaunchInstanceTemplates()
-	case 3:
-		listBootVolumes()
-	default:
-		if len(oracleSections) > 1 {
-			listOracleAccount()
-		}
-	}
-}
-
-func listInstances() {
-	fmt.Println("正在获取实例数据...")
-	var instances []core.Instance
-	var ins []core.Instance
-	var nextPage *string
-	var err error
-	for {
-		ins, nextPage, err = ListInstances(ctx, computeClient, nextPage)
-		if err == nil {
-			instances = append(instances, ins...)
-		}
-		if nextPage == nil || len(ins) == 0 {
-			break
-		}
-	}
-
+	// 获取可用性域
+	availabilityDomains, err = ListAvailabilityDomains()
 	if err != nil {
-		printlnErr("获取失败, 回车返回上一级菜单.", err.Error())
-		fmt.Scanln()
-		showMainMenu()
-		return
+		return fmt.Errorf("获取可用性域失败: %v", err)
 	}
-	if len(instances) == 0 {
-		fmt.Printf("\033[1;32m实例为空, 回车返回上一级菜单.\033[0m")
-		fmt.Scanln()
-		showMainMenu()
-		return
-	}
-	fmt.Printf("\n\033[1;32m实例信息\033[0m \n(当前账号: %s)\n\n", oracleSection.Name())
-	w := new(tabwriter.Writer)
-	w.Init(os.Stdout, 4, 8, 1, '\t', 0)
-	fmt.Fprintf(w, "%s\t%s\t%s\t%s\t\n", "序号", "名称", "状态　　", "配置")
-	//fmt.Printf("%-5s %-28s %-18s %-20s\n", "序号", "名称", "公共IP", "配置")
-	for i, ins := range instances {
-		// 获取实例公共IP
-		/*
-			var strIps string
-			ips, err := getInstancePublicIps(ctx, computeClient, networkClient, ins.Id)
-			if err != nil {
-				strIps = err.Error()
-			} else {
-				strIps = strings.Join(ips, ",")
-			}
-		*/
-		//fmt.Printf("%-7d %-30s %-20s %-20s\n", i+1, *ins.DisplayName, strIps, *ins.Shape)
-
-		fmt.Fprintf(w, "%d\t%s\t%s\t%s\t\n", i+1, *ins.DisplayName, getInstanceState(ins.LifecycleState), *ins.Shape)
-	}
-	w.Flush()
-	fmt.Println("--------------------")
-	fmt.Printf("\n\033[1;32ma: %s   b: %s   c: %s   d: %s\033[0m\n", "启动全部", "停止全部", "重启全部", "终止全部")
-	var input string
-	var index int
-	for {
-		fmt.Print("请输入序号查看实例详细信息: ")
-		_, err := fmt.Scanln(&input)
-		if err != nil {
-			showMainMenu()
-			return
-		}
-		switch input {
-		case "a":
-			fmt.Printf("确定启动全部实例？(输入 y 并回车): ")
-			var input string
-			fmt.Scanln(&input)
-			if strings.EqualFold(input, "y") {
-				for _, ins := range instances {
-					_, err := instanceAction(ins.Id, core.InstanceActionActionStart)
-					if err != nil {
-						fmt.Printf("\033[1;31m实例 %s 启动失败.\033[0m %s\n", *ins.DisplayName, err.Error())
-					} else {
-						fmt.Printf("\033[1;32m实例 %s 启动成功.\033[0m\n", *ins.DisplayName)
-					}
-				}
-			} else {
-				continue
-			}
-			time.Sleep(1 * time.Second)
-			listInstances()
-			return
-		case "b":
-			fmt.Printf("确定停止全部实例？(输入 y 并回车): ")
-			var input string
-			fmt.Scanln(&input)
-			if strings.EqualFold(input, "y") {
-				for _, ins := range instances {
-					_, err := instanceAction(ins.Id, core.InstanceActionActionSoftstop)
-					if err != nil {
-						fmt.Printf("\033[1;31m实例 %s 停止失败.\033[0m %s\n", *ins.DisplayName, err.Error())
-					} else {
-						fmt.Printf("\033[1;32m实例 %s 停止成功.\033[0m\n", *ins.DisplayName)
-					}
-				}
-			} else {
-				continue
-			}
-			time.Sleep(1 * time.Second)
-			listInstances()
-			return
-		case "c":
-			fmt.Printf("确定重启全部实例？(输入 y 并回车): ")
-			var input string
-			fmt.Scanln(&input)
-			if strings.EqualFold(input, "y") {
-				for _, ins := range instances {
-					_, err := instanceAction(ins.Id, core.InstanceActionActionSoftreset)
-					if err != nil {
-						fmt.Printf("\033[1;31m实例 %s 重启失败.\033[0m %s\n", *ins.DisplayName, err.Error())
-					} else {
-						fmt.Printf("\033[1;32m实例 %s 重启成功.\033[0m\n", *ins.DisplayName)
-					}
-				}
-			} else {
-				continue
-			}
-			time.Sleep(1 * time.Second)
-			listInstances()
-			return
-		case "d":
-			fmt.Printf("确定终止全部实例？(输入 y 并回车): ")
-			var input string
-			fmt.Scanln(&input)
-			if strings.EqualFold(input, "y") {
-				for _, ins := range instances {
-					err := terminateInstance(ins.Id)
-					if err != nil {
-						fmt.Printf("\033[1;31m实例 %s 终止失败.\033[0m %s\n", *ins.DisplayName, err.Error())
-					} else {
-						fmt.Printf("\033[1;32m实例 %s 终止成功.\033[0m\n", *ins.DisplayName)
-					}
-				}
-			} else {
-				continue
-			}
-			time.Sleep(1 * time.Second)
-			listInstances()
-			return
-		}
-		index, _ = strconv.Atoi(input)
-		if 0 < index && index <= len(instances) {
-			break
-		} else {
-			input = ""
-			index = 0
-			fmt.Printf("\033[1;31m错误! 请输入正确的序号\033[0m\n")
-		}
-	}
-	instanceDetails(instances[index-1].Id)
-}
-
-func instanceDetails(instanceId *string) {
-	for {
-		fmt.Println("正在获取实例详细信息...")
-		instance, err := getInstance(instanceId)
-		if err != nil {
-			fmt.Printf("\033[1;31m获取实例详细信息失败, 回车返回上一级菜单.\033[0m")
-			fmt.Scanln()
-			listInstances()
-			return
-		}
-		vnics, err := getInstanceVnics(instanceId)
-		if err != nil {
-			fmt.Printf("\033[1;31m获取实例VNIC失败, 回车返回上一级菜单.\033[0m")
-			fmt.Scanln()
-			listInstances()
-			return
-		}
-		var publicIps = make([]string, 0)
-		var strPublicIps string
-		if err != nil {
-			strPublicIps = err.Error()
-		} else {
-			for _, vnic := range vnics {
-				if vnic.PublicIp != nil {
-					publicIps = append(publicIps, *vnic.PublicIp)
-				}
-			}
-			strPublicIps = strings.Join(publicIps, ",")
-		}
-
-		fmt.Printf("\n\033[1;32m实例详细信息\033[0m \n(当前账号: %s)\n\n", oracleSection.Name())
-		fmt.Println("--------------------")
-		fmt.Printf("名称: %s\n", *instance.DisplayName)
-		fmt.Printf("状态: %s\n", getInstanceState(instance.LifecycleState))
-		fmt.Printf("公共IP: %s\n", strPublicIps)
-		fmt.Printf("可用性域: %s\n", *instance.AvailabilityDomain)
-		fmt.Printf("配置: %s\n", *instance.Shape)
-		fmt.Printf("OCPU计数: %g\n", *instance.ShapeConfig.Ocpus)
-		fmt.Printf("网络带宽(Gbps): %g\n", *instance.ShapeConfig.NetworkingBandwidthInGbps)
-		fmt.Printf("内存(GB): %g\n\n", *instance.ShapeConfig.MemoryInGBs)
-		fmt.Printf("Oracle Cloud Agent 插件配置情况\n")
-		fmt.Printf("监控插件已禁用？: %t\n", *instance.AgentConfig.IsMonitoringDisabled)
-		fmt.Printf("管理插件已禁用？: %t\n", *instance.AgentConfig.IsManagementDisabled)
-		fmt.Printf("所有插件均已禁用？: %t\n", *instance.AgentConfig.AreAllPluginsDisabled)
-		for _, value := range instance.AgentConfig.PluginsConfig {
-			fmt.Printf("%s: %s\n", *value.Name, value.DesiredState)
-		}
-		fmt.Println("--------------------")
-		fmt.Printf("\n\033[1;32m1: %s   2: %s   3: %s   4: %s   5: %s\033[0m\n", "启动", "停止", "重启", "终止", "更换公共IP")
-		fmt.Printf("\033[1;32m6: %s   7: %s   8: %s\033[0m\n", "升级/降级", "修改名称", "Oracle Cloud Agent 插件配置")
-		var input string
-		var num int
-		fmt.Print("\n请输入需要执行操作的序号: ")
-		fmt.Scanln(&input)
-		num, _ = strconv.Atoi(input)
-		switch num {
-		case 1:
-			_, err := instanceAction(instance.Id, core.InstanceActionActionStart)
-			if err != nil {
-				fmt.Printf("\033[1;31m启动实例失败.\033[0m %s\n", err.Error())
-			} else {
-				fmt.Printf("\033[1;32m正在启动实例, 请稍后查看实例状态\033[0m\n")
-			}
-			time.Sleep(1 * time.Second)
-
-		case 2:
-			_, err := instanceAction(instance.Id, core.InstanceActionActionSoftstop)
-			if err != nil {
-				fmt.Printf("\033[1;31m停止实例失败.\033[0m %s\n", err.Error())
-			} else {
-				fmt.Printf("\033[1;32m正在停止实例, 请稍后查看实例状态\033[0m\n")
-			}
-			time.Sleep(1 * time.Second)
-
-		case 3:
-			_, err := instanceAction(instance.Id, core.InstanceActionActionSoftreset)
-			if err != nil {
-				fmt.Printf("\033[1;31m重启实例失败.\033[0m %s\n", err.Error())
-			} else {
-				fmt.Printf("\033[1;32m正在重启实例, 请稍后查看实例状态\033[0m\n")
-			}
-			time.Sleep(1 * time.Second)
-
-		case 4:
-			fmt.Printf("确定终止实例？(输入 y 并回车): ")
-			var input string
-			fmt.Scanln(&input)
-			if strings.EqualFold(input, "y") {
-				err := terminateInstance(instance.Id)
-				if err != nil {
-					fmt.Printf("\033[1;31m终止实例失败.\033[0m %s\n", err.Error())
-				} else {
-					fmt.Printf("\033[1;32m正在终止实例, 请稍后查看实例状态\033[0m\n")
-				}
-				time.Sleep(1 * time.Second)
-			}
-
-		case 5:
-			if len(vnics) == 0 {
-				fmt.Printf("\033[1;31m实例已终止或获取实例VNIC失败，请稍后重试.\033[0m\n")
-				break
-			}
-			fmt.Printf("将删除当前公共IP并创建一个新的公共IP。确定更换实例公共IP？(输入 y 并回车): ")
-			var input string
-			fmt.Scanln(&input)
-			if strings.EqualFold(input, "y") {
-				publicIp, err := changePublicIp(vnics)
-				if err != nil {
-					fmt.Printf("\033[1;31m更换实例公共IP失败.\033[0m %s\n", err.Error())
-				} else {
-					fmt.Printf("\033[1;32m更换实例公共IP成功, 实例公共IP: \033[0m%s\n", *publicIp.IpAddress)
-				}
-				time.Sleep(1 * time.Second)
-			}
-
-		case 6:
-			fmt.Printf("升级/降级实例, 请输入CPU个数: ")
-			var input string
-			var ocpus float32
-			var memoryInGBs float32
-			fmt.Scanln(&input)
-			value, _ := strconv.ParseFloat(input, 32)
-			ocpus = float32(value)
-			input = ""
-			fmt.Printf("升级/降级实例, 请输入内存大小: ")
-			fmt.Scanln(&input)
-			value, _ = strconv.ParseFloat(input, 32)
-			memoryInGBs = float32(value)
-			fmt.Println("正在升级/降级实例...")
-			_, err := updateInstance(instance.Id, nil, &ocpus, &memoryInGBs, nil, nil)
-			if err != nil {
-				fmt.Printf("\033[1;31m升级/降级实例失败.\033[0m %s\n", err.Error())
-			} else {
-				fmt.Printf("\033[1;32m升级/降级实例成功.\033[0m\n")
-			}
-			time.Sleep(1 * time.Second)
-
-		case 7:
-			fmt.Printf("请为实例输入一个新的名称: ")
-			var input string
-			fmt.Scanln(&input)
-			fmt.Println("正在修改实例名称...")
-			_, err := updateInstance(instance.Id, &input, nil, nil, nil, nil)
-			if err != nil {
-				fmt.Printf("\033[1;31m修改实例名称失败.\033[0m %s\n", err.Error())
-			} else {
-				fmt.Printf("\033[1;32m修改实例名称成功.\033[0m\n")
-			}
-			time.Sleep(1 * time.Second)
-
-		case 8:
-			fmt.Printf("Oracle Cloud Agent 插件配置, 请输入 (1: 启用管理和监控插件; 2: 禁用管理和监控插件): ")
-			var input string
-			fmt.Scanln(&input)
-			if input == "1" {
-				disable := false
-				_, err := updateInstance(instance.Id, nil, nil, nil, instance.AgentConfig.PluginsConfig, &disable)
-				if err != nil {
-					fmt.Printf("\033[1;31m启用管理和监控插件失败.\033[0m %s\n", err.Error())
-				} else {
-					fmt.Printf("\033[1;32m启用管理和监控插件成功.\033[0m\n")
-				}
-			} else if input == "2" {
-				disable := true
-				_, err := updateInstance(instance.Id, nil, nil, nil, instance.AgentConfig.PluginsConfig, &disable)
-				if err != nil {
-					fmt.Printf("\033[1;31m禁用管理和监控插件失败.\033[0m %s\n", err.Error())
-				} else {
-					fmt.Printf("\033[1;32m禁用管理和监控插件成功.\033[0m\n")
-				}
-			} else {
-				fmt.Printf("\033[1;31m输入错误.\033[0m\n")
-			}
-			time.Sleep(1 * time.Second)
-
-		default:
-			listInstances()
-			return
-		}
-	}
-}
-
-func listBootVolumes() {
-	var bootVolumes []core.BootVolume
-	var wg sync.WaitGroup
-	for _, ad := range availabilityDomains {
-		wg.Add(1)
-		go func(adName *string) {
-			defer wg.Done()
-			volumes, err := getBootVolumes(adName)
-			if err != nil {
-				printlnErr("获取引导卷失败", err.Error())
-			} else {
-				bootVolumes = append(bootVolumes, volumes...)
-			}
-		}(ad.Name)
-	}
-	wg.Wait()
-
-	fmt.Printf("\n\033[1;32m引导卷\033[0m \n(当前账号: %s)\n\n", oracleSection.Name())
-	w := new(tabwriter.Writer)
-	w.Init(os.Stdout, 4, 8, 1, '\t', 0)
-	fmt.Fprintf(w, "%s\t%s\t%s\t%s\t\n", "序号", "名称", "状态　　", "大小(GB)")
-	for i, volume := range bootVolumes {
-		fmt.Fprintf(w, "%d\t%s\t%s\t%d\t\n", i+1, *volume.DisplayName, getBootVolumeState(volume.LifecycleState), *volume.SizeInGBs)
-	}
-	w.Flush()
-	fmt.Printf("\n")
-	var input string
-	var index int
-	for {
-		fmt.Print("请输入序号查看引导卷详细信息: ")
-		_, err := fmt.Scanln(&input)
-		if err != nil {
-			showMainMenu()
-			return
-		}
-		index, _ = strconv.Atoi(input)
-		if 0 < index && index <= len(bootVolumes) {
-			break
-		} else {
-			input = ""
-			index = 0
-			fmt.Printf("\033[1;31m错误! 请输入正确的序号\033[0m\n")
-		}
-	}
-	bootvolumeDetails(bootVolumes[index-1].Id)
-}
-
-func bootvolumeDetails(bootVolumeId *string) {
-	for {
-		fmt.Println("正在获取引导卷详细信息...")
-		bootVolume, err := getBootVolume(bootVolumeId)
-		if err != nil {
-			fmt.Printf("\033[1;31m获取引导卷详细信息失败, 回车返回上一级菜单.\033[0m")
-			fmt.Scanln()
-			listBootVolumes()
-			return
-		}
-
-		attachments, err := listBootVolumeAttachments(bootVolume.AvailabilityDomain, bootVolume.CompartmentId, bootVolume.Id)
-		attachIns := make([]string, 0)
-		if err != nil {
-			attachIns = append(attachIns, err.Error())
-		} else {
-			for _, attachment := range attachments {
-				ins, err := getInstance(attachment.InstanceId)
-				if err != nil {
-					attachIns = append(attachIns, err.Error())
-				} else {
-					attachIns = append(attachIns, *ins.DisplayName)
-				}
-			}
-		}
-
-		var performance string
-		switch *bootVolume.VpusPerGB {
-		case 10:
-			performance = fmt.Sprintf("均衡 (VPU:%d)", *bootVolume.VpusPerGB)
-		case 20:
-			performance = fmt.Sprintf("性能较高 (VPU:%d)", *bootVolume.VpusPerGB)
-		default:
-			performance = fmt.Sprintf("UHP (VPU:%d)", *bootVolume.VpusPerGB)
-		}
-
-		fmt.Printf("\n\033[1;32m引导卷详细信息\033[0m \n(当前账号: %s)\n\n", oracleSection.Name())
-		fmt.Println("--------------------")
-		fmt.Printf("名称: %s\n", *bootVolume.DisplayName)
-		fmt.Printf("状态: %s\n", getBootVolumeState(bootVolume.LifecycleState))
-		fmt.Printf("可用性域: %s\n", *bootVolume.AvailabilityDomain)
-		fmt.Printf("大小(GB): %d\n", *bootVolume.SizeInGBs)
-		fmt.Printf("性能: %s\n", performance)
-		fmt.Printf("附加的实例: %s\n", strings.Join(attachIns, ","))
-		fmt.Println("--------------------")
-		fmt.Printf("\n\033[1;32m1: %s   2: %s   3: %s   4: %s\033[0m\n", "修改性能", "修改大小", "分离引导卷", "终止引导卷")
-		var input string
-		var num int
-		fmt.Print("\n请输入需要执行操作的序号: ")
-		fmt.Scanln(&input)
-		num, _ = strconv.Atoi(input)
-		switch num {
-		case 1:
-			fmt.Printf("修改引导卷性能, 请输入 (1: 均衡; 2: 性能较高): ")
-			var input string
-			fmt.Scanln(&input)
-			if input == "1" {
-				_, err := updateBootVolume(bootVolume.Id, nil, common.Int64(10))
-				if err != nil {
-					fmt.Printf("\033[1;31m修改引导卷性能失败.\033[0m %s\n", err.Error())
-				} else {
-					fmt.Printf("\033[1;32m修改引导卷性能成功, 请稍后查看引导卷状态\033[0m\n")
-				}
-			} else if input == "2" {
-				_, err := updateBootVolume(bootVolume.Id, nil, common.Int64(20))
-				if err != nil {
-					fmt.Printf("\033[1;31m修改引导卷性能失败.\033[0m %s\n", err.Error())
-				} else {
-					fmt.Printf("\033[1;32m修改引导卷性能成功, 请稍后查看引导卷信息\033[0m\n")
-				}
-			} else {
-				fmt.Printf("\033[1;31m输入错误.\033[0m\n")
-			}
-			time.Sleep(1 * time.Second)
-
-		case 2:
-			fmt.Printf("修改引导卷大小, 请输入 (例如修改为50GB, 输入50): ")
-			var input string
-			var sizeInGBs int64
-			fmt.Scanln(&input)
-			sizeInGBs, _ = strconv.ParseInt(input, 10, 64)
-			if sizeInGBs > 0 {
-				_, err := updateBootVolume(bootVolume.Id, &sizeInGBs, nil)
-				if err != nil {
-					fmt.Printf("\033[1;31m修改引导卷大小失败.\033[0m %s\n", err.Error())
-				} else {
-					fmt.Printf("\033[1;32m修改引导卷大小成功, 请稍后查看引导卷信息\033[0m\n")
-				}
-			} else {
-				fmt.Printf("\033[1;31m输入错误.\033[0m\n")
-			}
-			time.Sleep(1 * time.Second)
-
-		case 3:
-			fmt.Printf("确定分离引导卷？(输入 y 并回车): ")
-			var input string
-			fmt.Scanln(&input)
-			if strings.EqualFold(input, "y") {
-				for _, attachment := range attachments {
-					_, err := detachBootVolume(attachment.Id)
-					if err != nil {
-						fmt.Printf("\033[1;31m分离引导卷失败.\033[0m %s\n", err.Error())
-					} else {
-						fmt.Printf("\033[1;32m分离引导卷成功, 请稍后查看引导卷信息\033[0m\n")
-					}
-				}
-			}
-			time.Sleep(1 * time.Second)
-
-		case 4:
-			fmt.Printf("确定终止引导卷？(输入 y 并回车): ")
-			var input string
-			fmt.Scanln(&input)
-			if strings.EqualFold(input, "y") {
-				_, err := deleteBootVolume(bootVolume.Id)
-				if err != nil {
-					fmt.Printf("\033[1;31m终止引导卷失败.\033[0m %s\n", err.Error())
-				} else {
-					fmt.Printf("\033[1;32m终止引导卷成功, 请稍后查看引导卷信息\033[0m\n")
-				}
-
-			}
-			time.Sleep(1 * time.Second)
-
-		default:
-			listBootVolumes()
-			return
-		}
-	}
-}
-
-func listLaunchInstanceTemplates() {
-	var instanceSections []*ini.Section
-	instanceSections = append(instanceSections, instanceBaseSection.ChildSections()...)
-	instanceSections = append(instanceSections, oracleSection.ChildSections()...)
-	if len(instanceSections) == 0 {
-		fmt.Printf("\033[1;31m未找到实例模版, 回车返回上一级菜单.\033[0m")
-		fmt.Scanln()
-		showMainMenu()
-		return
-	}
-
-	for {
-		fmt.Printf("\n\033[1;32m选择对应的实例模版开始创建实例\033[0m \n(当前账号: %s)\n\n", oracleSectionName)
-		w := new(tabwriter.Writer)
-		w.Init(os.Stdout, 4, 8, 1, '\t', 0)
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t\n", "序号", "配置", "CPU个数", "内存(GB)")
-		for i, instanceSec := range instanceSections {
-			cpu := instanceSec.Key("cpus").Value()
-			if cpu == "" {
-				cpu = "-"
-			}
-			memory := instanceSec.Key("memoryInGBs").Value()
-			if memory == "" {
-				memory = "-"
-			}
-			fmt.Fprintf(w, "%d\t%s\t%s\t%s\t\n", i+1, instanceSec.Key("shape").Value(), cpu, memory)
-		}
-		w.Flush()
-		fmt.Printf("\n")
-		var input string
-		var index int
-		for {
-			fmt.Print("请输入需要创建的实例的序号: ")
-			_, err := fmt.Scanln(&input)
-			if err != nil {
-				showMainMenu()
-				return
-			}
-			index, _ = strconv.Atoi(input)
-			if 0 < index && index <= len(instanceSections) {
-				break
-			} else {
-				input = ""
-				index = 0
-				fmt.Printf("\033[1;31m错误! 请输入正确的序号\033[0m\n")
-			}
-		}
-
-		instanceSection := instanceSections[index-1]
-		instance = Instance{}
-		err := instanceSection.MapTo(&instance)
-		if err != nil {
-			printlnErr("解析实例模版参数失败", err.Error())
-			continue
-		}
-
-		LaunchInstances(availabilityDomains)
-	}
-
-}
-
-func multiBatchLaunchInstances() {
-	IPsFilePath := IPsFilePrefix + "-" + time.Now().Format("2006-01-02-150405.txt")
-	for _, sec := range oracleSections {
-		var err error
-		err = initVar(sec)
-		if err != nil {
-			continue
-		}
-		// 获取可用性域
-		availabilityDomains, err = ListAvailabilityDomains()
-		if err != nil {
-			printlnErr("获取可用性域失败", err.Error())
-			continue
-		}
-		batchLaunchInstances(sec)
-		batchListInstancesIp(IPsFilePath, sec)
-		command(cmd)
-		sleepRandomSecond(5, 5)
-	}
-}
-
-func batchLaunchInstances(oracleSec *ini.Section) {
-	var instanceSections []*ini.Section
-	instanceSections = append(instanceSections, instanceBaseSection.ChildSections()...)
-	instanceSections = append(instanceSections, oracleSec.ChildSections()...)
-	if len(instanceSections) == 0 {
-		return
-	}
-
-	printf("\033[1;36m[%s] 开始创建\033[0m\n", oracleSectionName)
-	var SUM, NUM int32 = 0, 0
-	sendMessage(fmt.Sprintf("[%s]", oracleSectionName), "开始创建")
-
-	for _, instanceSec := range instanceSections {
-		instance = Instance{}
-		err := instanceSec.MapTo(&instance)
-		if err != nil {
-			printlnErr("解析实例模版参数失败", err.Error())
-			continue
-		}
-
-		sum, num := LaunchInstances(availabilityDomains)
-
-		SUM = SUM + sum
-		NUM = NUM + num
-
-	}
-	printf("\033[1;36m[%s] 结束创建。创建实例总数: %d, 成功 %d , 失败 %d\033[0m\n", oracleSectionName, SUM, NUM, SUM-NUM)
-	text := fmt.Sprintf("结束创建。创建实例总数: %d, 成功 %d , 失败 %d", SUM, NUM, SUM-NUM)
-	sendMessage(fmt.Sprintf("[%s]", oracleSectionName), text)
-}
-
-func multiBatchListInstancesIp() {
-	IPsFilePath := IPsFilePrefix + "-" + time.Now().Format("2006-01-02-150405.txt")
-	_, err := os.Stat(IPsFilePath)
-	if err != nil && os.IsNotExist(err) {
-		os.Create(IPsFilePath)
-	}
-
-	fmt.Printf("正在导出实例公共IP地址...\n")
-	for _, sec := range oracleSections {
-		err := initVar(sec)
-		if err != nil {
-			continue
-		}
-		ListInstancesIPs(IPsFilePath, sec.Name())
-	}
-	fmt.Printf("导出实例公共IP地址完成，请查看文件 %s\n", IPsFilePath)
-}
-
-func batchListInstancesIp(filePath string, sec *ini.Section) {
-	_, err := os.Stat(filePath)
-	if err != nil && os.IsNotExist(err) {
-		os.Create(filePath)
-	}
-	fmt.Printf("正在导出实例公共IP地址...\n")
-	ListInstancesIPs(filePath, sec.Name())
-	fmt.Printf("导出实例IP地址完成，请查看文件 %s\n", filePath)
-}
-
-func ListInstancesIPs(filePath string, sectionName string) {
-	var vnicAttachments []core.VnicAttachment
-	var vas []core.VnicAttachment
-	var nextPage *string
-	var err error
-	for {
-		vas, nextPage, err = ListVnicAttachments(ctx, computeClient, nil, nextPage)
-		if err == nil {
-			vnicAttachments = append(vnicAttachments, vas...)
-		}
-		if nextPage == nil || len(vas) == 0 {
-			break
-		}
-	}
-
-	if err != nil {
-		fmt.Printf("ListVnicAttachments Error: %s\n", err.Error())
-		return
-	}
-	file, err := os.OpenFile(filePath, os.O_APPEND|os.O_WRONLY, os.ModeAppend)
-	if err != nil {
-		fmt.Printf("打开文件失败, Error: %s\n", err.Error())
-		return
-	}
-	_, err = io.WriteString(file, "["+sectionName+"]\n")
-	if err != nil {
-		fmt.Printf("%s\n", err.Error())
-	}
-	for _, vnicAttachment := range vnicAttachments {
-		vnic, err := GetVnic(ctx, networkClient, vnicAttachment.VnicId)
-		if err != nil {
-			fmt.Printf("IP地址获取失败, %s\n", err.Error())
-			continue
-		}
-		fmt.Printf("[%s] 实例: %s, IP: %s\n", sectionName, *vnic.DisplayName, *vnic.PublicIp)
-		_, err = io.WriteString(file, "实例: "+*vnic.DisplayName+", IP: "+*vnic.PublicIp+"\n")
-		if err != nil {
-			fmt.Printf("写入文件失败, Error: %s\n", err.Error())
-		}
-	}
-	_, err = io.WriteString(file, "\n")
-	if err != nil {
-		fmt.Printf("%s\n", err.Error())
-	}
+	return nil
 }
 
 // 返回值 sum: 创建实例总数; num: 创建成功的个数
@@ -1003,6 +1274,11 @@ func LaunchInstances(ads []identity.AvailabilityDomain) (sum, num int32) {
 	 * 2. 没有设置 availabilityDomain 但是设置了 each 参数。即在获取的每个可用性域中创建 each 个实例，创建的实例总数 sum =  each * adCount。
 	 * 3. 没有设置 availabilityDomain 且没有设置 each 参数，即在获取到的可用性域中创建的实例总数为 sum。
 	 */
+	// 检查可用性域列表是否为空
+	if len(ads) == 0 {
+		log.Println("错误：可用性域列表为空")
+		return 0, 0
+	}
 
 	//可用性域数量
 	var adCount int32 = int32(len(ads))
@@ -1148,6 +1424,11 @@ func LaunchInstances(ads []identity.AvailabilityDomain) (sum, num int32) {
 				}
 				if adIndex >= adCount {
 					adIndex = 0
+				}
+				// 在使用 ads[adIndex] 之前，确保 adIndex 在有效范围内
+				if adIndex < 0 || adIndex >= adCount {
+					log.Printf("错误：无效的可用性域索引 %d", adIndex)
+					return sum, num
 				}
 				//adName = ads[adIndex].Name
 				adName = usableAds[adIndex].Name
@@ -1342,137 +1623,6 @@ func sleepRandomSecond(min, max int32) {
 // ExampleLaunchInstance does create an instance
 // NOTE: launch instance will create a new instance and VCN. please make sure delete the instance
 // after execute this sample code, otherwise, you will be charged for the running instance
-func ExampleLaunchInstance() {
-	c, err := core.NewComputeClientWithConfigurationProvider(provider)
-	helpers.FatalIfError(err)
-	networkClient, err := core.NewVirtualNetworkClientWithConfigurationProvider(provider)
-	helpers.FatalIfError(err)
-	ctx := context.Background()
-
-	// create the launch instance request
-	request := core.LaunchInstanceRequest{}
-	request.CompartmentId = common.String(oracle.Tenancy)
-	request.DisplayName = common.String(instance.InstanceDisplayName)
-	request.AvailabilityDomain = common.String(instance.AvailabilityDomain)
-
-	// create a subnet or get the one already created
-	subnet, err := CreateOrGetNetworkInfrastructure(ctx, networkClient)
-	helpers.FatalIfError(err)
-	fmt.Println("subnet created")
-	request.CreateVnicDetails = &core.CreateVnicDetails{SubnetId: subnet.Id}
-
-	// get a image
-	images, err := listImages(ctx, c)
-	helpers.FatalIfError(err)
-	image := images[0]
-	fmt.Println("list images")
-	request.SourceDetails = core.InstanceSourceViaImageDetails{
-		ImageId:             image.Id,
-		BootVolumeSizeInGBs: common.Int64(instance.BootVolumeSizeInGBs),
-	}
-
-	// use [config.Shape] to create instance
-	request.Shape = common.String(instance.Shape)
-
-	request.ShapeConfig = &core.LaunchInstanceShapeConfigDetails{
-		Ocpus:       common.Float32(instance.Ocpus),
-		MemoryInGBs: common.Float32(instance.MemoryInGBs),
-	}
-
-	// add ssh_authorized_keys
-	//metaData := map[string]string{
-	//	"ssh_authorized_keys": config.SSH_Public_Key,
-	//}
-	//request.Metadata = metaData
-	request.Metadata = map[string]string{"ssh_authorized_keys": instance.SSH_Public_Key}
-
-	// default retry policy will retry on non-200 response
-	request.RequestMetadata = helpers.GetRequestMetadataWithDefaultRetryPolicy()
-
-	createResp, err := c.LaunchInstance(ctx, request)
-	helpers.FatalIfError(err)
-
-	fmt.Println("launching instance")
-
-	// should retry condition check which returns a bool value indicating whether to do retry or not
-	// it checks the lifecycle status equals to Running or not for this case
-	shouldRetryFunc := func(r common.OCIOperationResponse) bool {
-		if converted, ok := r.Response.(core.GetInstanceResponse); ok {
-			return converted.LifecycleState != core.InstanceLifecycleStateRunning
-		}
-		return true
-	}
-
-	// create get instance request with a retry policy which takes a function
-	// to determine shouldRetry or not
-	pollingGetRequest := core.GetInstanceRequest{
-		InstanceId:      createResp.Instance.Id,
-		RequestMetadata: helpers.GetRequestMetadataWithCustomizedRetryPolicy(shouldRetryFunc),
-	}
-
-	instance, pollError := c.GetInstance(ctx, pollingGetRequest)
-	helpers.FatalIfError(pollError)
-
-	fmt.Println("instance launched")
-
-	// 创建辅助 VNIC 并将其附加到指定的实例
-	attachVnicResponse, err := c.AttachVnic(context.Background(), core.AttachVnicRequest{
-		AttachVnicDetails: core.AttachVnicDetails{
-			CreateVnicDetails: &core.CreateVnicDetails{
-				SubnetId:       subnet.Id,
-				AssignPublicIp: common.Bool(true),
-			},
-			InstanceId: instance.Id,
-		},
-	})
-
-	helpers.FatalIfError(err)
-	fmt.Println("vnic attached")
-
-	vnicState := attachVnicResponse.VnicAttachment.LifecycleState
-	for vnicState != core.VnicAttachmentLifecycleStateAttached {
-		time.Sleep(15 * time.Second)
-		getVnicAttachmentRequest, err := c.GetVnicAttachment(context.Background(), core.GetVnicAttachmentRequest{
-			VnicAttachmentId: attachVnicResponse.Id,
-		})
-		helpers.FatalIfError(err)
-		vnicState = getVnicAttachmentRequest.VnicAttachment.LifecycleState
-	}
-
-	// 分离并删除指定的辅助 VNIC
-	_, err = c.DetachVnic(context.Background(), core.DetachVnicRequest{
-		VnicAttachmentId: attachVnicResponse.Id,
-	})
-
-	helpers.FatalIfError(err)
-	fmt.Println("vnic dettached")
-
-	defer func() {
-		terminateInstance(createResp.Id)
-
-		client, clerr := core.NewVirtualNetworkClientWithConfigurationProvider(common.DefaultConfigProvider())
-		helpers.FatalIfError(clerr)
-
-		vcnID := subnet.VcnId
-		deleteSubnet(ctx, client, subnet.Id)
-		deleteVcn(ctx, client, vcnID)
-	}()
-
-	// Output:
-	// subnet created
-	// list images
-	// list shapes
-	// launching instance
-	// instance launched
-	// vnic attached
-	// vnic dettached
-	// terminating instance
-	// instance terminated
-	// deleteing subnet
-	// subnet deleted
-	// deleteing VCN
-	// VCN deleted
-}
 
 func getProvider(oracle Oracle) (common.ConfigurationProvider, error) {
 	content, err := ioutil.ReadFile(oracle.Key_file)
@@ -1482,6 +1632,18 @@ func getProvider(oracle Oracle) (common.ConfigurationProvider, error) {
 	privateKey := string(content)
 	privateKeyPassphrase := common.String(oracle.Key_password)
 	return common.NewRawConfigurationProvider(oracle.Tenancy, oracle.User, oracle.Region, oracle.Fingerprint, privateKey, privateKeyPassphrase), nil
+}
+
+func currMouthFirstLastDay() (time.Time, time.Time) {
+	// 获取当前时间
+	now := time.Now().UTC()
+	// 获取当前月份的第一天
+	firstDay := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, now.Location())
+	// 获取下个月的第一天
+	nextMonth := now.AddDate(0, 1, 0)
+	firstDayOfNextMonth := time.Date(nextMonth.Year(), nextMonth.Month(), 1, 0, 0, 0, 0, nextMonth.Location())
+
+	return firstDay, firstDayOfNextMonth
 }
 
 // 创建或获取基础网络设施
@@ -1856,26 +2018,6 @@ func ListAvailabilityDomains() ([]identity.AvailabilityDomain, error) {
 	}
 	resp, err := identityClient.ListAvailabilityDomains(ctx, req)
 	return resp.Items, err
-}
-
-func getUsers() {
-	req := identity.ListUsersRequest{
-		CompartmentId:   &oracle.Tenancy,
-		RequestMetadata: getCustomRequestMetadataWithRetryPolicy(),
-	}
-	resp, _ := identityClient.ListUsers(ctx, req)
-	for _, user := range resp.Items {
-		var userName string
-		if user.Name != nil {
-			userName = *user.Name
-		}
-		var email string
-		if user.Email != nil {
-			email = *user.Email
-		}
-		fmt.Println("用户名:", userName, "邮箱:", email)
-	}
-
 }
 
 func ListInstances(ctx context.Context, c core.ComputeClient, page *string) ([]core.Instance, *string, error) {
@@ -2276,7 +2418,10 @@ func getBootVolumes(availabilityDomain *string) ([]core.BootVolume, error) {
 		RequestMetadata:    getCustomRequestMetadataWithRetryPolicy(),
 	}
 	resp, err := storageClient.ListBootVolumes(ctx, req)
-	return resp.Items, err
+	if err != nil {
+		return nil, fmt.Errorf("获取引导卷列表失败: %v", err)
+	}
+	return resp.Items, nil
 }
 
 // 获取指定引导卷
@@ -2534,19 +2679,4 @@ func getCustomRetryPolicy() *common.RetryPolicy {
 		common.WithMaximumNumberAttempts(attempts),
 		common.WithShouldRetryOperation(retryOnAllNon200ResponseCodes))
 	return &policy
-}
-
-func command(cmd string) {
-	res := strings.Fields(cmd)
-	if len(res) > 0 {
-		fmt.Println("执行命令:", strings.Join(res, " "))
-		name := res[0]
-		arg := res[1:]
-		out, err := exec.Command(name, arg...).CombinedOutput()
-		if err == nil {
-			fmt.Println(string(out))
-		} else {
-			fmt.Println(err)
-		}
-	}
 }
